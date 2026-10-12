@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>红玫瑰</title>
+<link rel="apple-touch-icon" href="rose-icon.png">
+<style>
+/* Layout: one full-bleed stage. The rose floats on a wine-dark glow; title, hint and replay button sit on the bottom edge. */
+:root{
+  --bg-0:#13070b;
+  --bg-1:#34111c;
+  --fg:#f6e9e6;
+  --fg-dim:#b89ea0;
+  --accent:#e23a53;
+  --line:rgba(246,233,230,.22);
+  --ui:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;
+  color-scheme:dark;
+}
+html,body{height:100%}
+body{margin:0;background:var(--bg-0);color:var(--fg);font:15px/1.5 var(--ui);overflow:hidden;-webkit-text-size-adjust:100%}
+#stage{position:relative;width:100%;height:100%;background:radial-gradient(ellipse 85% 62% at 50% 40%,var(--bg-1) 0%,var(--bg-0) 72%);touch-action:none;cursor:grab;-webkit-user-select:none;user-select:none}
+#stage.drag{cursor:grabbing}
+#stage canvas{display:block;width:100%;height:100%}
+.cap{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding:0 16px 18px;pointer-events:none}
+.cap h1{margin:0;font-size:1.1rem;font-weight:500;letter-spacing:.32em}
+.cap p{margin:4px 0 0;font-size:.8rem;color:var(--fg-dim);letter-spacing:.08em}
+#replay{pointer-events:auto;min-height:44px;padding:0 18px;border:1px solid var(--line);border-radius:999px;background:rgba(19,7,11,.55);color:var(--fg);font:inherit;font-size:.85rem;letter-spacing:.12em;cursor:pointer}
+#replay:hover{border-color:var(--accent)}
+#replay:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.fail{position:absolute;inset:0;display:grid;place-items:center;padding:24px;text-align:center;color:var(--fg-dim)}
+</style>
+
+<div id="stage">
+  <div class="cap">
+    <div>
+      <h1>红玫瑰</h1>
+      <p>拖动旋转 · 双指缩放</p>
+    </div>
+    <button id="replay" type="button">重新绽放</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  var stage = document.getElementById('stage');
+  var reduce = false;
+  try { reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+
+  function fail(msg) {
+    var d = document.createElement('div');
+    d.className = 'fail';
+    d.textContent = msg;
+    stage.appendChild(d);
+  }
+  if (!window.THREE) { fail('3D 组件没有加载出来。请确认网络能访问境外资源，然后刷新页面。'); return; }
+
+  var renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  } catch (e) { fail('这个浏览器打不开 3D 画面。'); return; }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.domElement.setAttribute('role', 'img');
+  renderer.domElement.setAttribute('aria-label', '可以旋转查看的 3D 红玫瑰');
+  stage.insertBefore(renderer.domElement, stage.firstChild);
+
+  /* ---------- helpers ---------- */
+  var TAU = Math.PI * 2, GOLDEN = Math.PI * (3 - Math.sqrt(5));
+  function clamp(x, a, b) { return Math.min(b, Math.max(a, x)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smooth(a, b, x) { var t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
+  function rng(seed) {
+    return function () {
+      seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+      var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  /* A (nu+1) x (nv+1) surface; fn(u01, v01) returns [x, y, z, r, g, b]. */
+  function grid(nu, nv, fn) {
+    var pos = [], col = [], idx = [], i, j;
+    for (j = 0; j <= nv; j++) {
+      for (i = 0; i <= nu; i++) {
+        var o = fn(i / nu, j / nv);
+        pos.push(o[0], o[1], o[2]);
+        col.push(o[3], o[4], o[5]);
+      }
+    }
+    for (j = 0; j < nv; j++) {
+      for (i = 0; i < nu; i++) {
+        var a = j * (nu + 1) + i, b = a + 1, c = a + nu + 1, d = c + 1;
+        idx.push(a, c, b, b, c, d);
+      }
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    return g;
+  }
+
+  var C = {
+    pBase: new THREE.Color(0x3a0309),
+    pMid: new THREE.Color(0x92091f),
+    pTip: new THREE.Color(0xc9122e),
+    gDark: new THREE.Color(0x12331a),
+    gMid: new THREE.Color(0x2a6330),
+    gLight: new THREE.Color(0x66a352)
+  };
+  var tmp = new THREE.Color();
+
+  /* ---------- scene ---------- */
+  var scene = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(36, 1, 0.1, 60);
+  var root = new THREE.Group();          // turned by the viewer
+  scene.add(root);
+  var plant = new THREE.Group();         // lifted so the whole plant is centred on the turning point
+  plant.position.y = 1.05;
+  root.add(plant);
+
+  scene.add(new THREE.HemisphereLight(0xffe3e0, 0x2a0b14, 0.55));
+  var key = new THREE.DirectionalLight(0xfff1e8, 1.7); key.position.set(3, 5, 4); scene.add(key);
+  var rim = new THREE.DirectionalLight(0xff4a68, 1.2); rim.position.set(-4, 2, -3); scene.add(rim);
+  var fill = new THREE.PointLight(0xffc7b8, 0.5, 14); fill.position.set(0, 1, 4); scene.add(fill);
+  var core = new THREE.PointLight(0xff2a4a, 0.8, 2.6); core.position.set(0, 0.1, 0); plant.add(core);
+
+  /* ---------- petals: a golden-angle spiral from the heart outward ---------- */
+  var NP = 34;
+  function petalParams(t, rnd) {
+    return {
+      L: (0.60 + 0.42 * t) * (0.96 + rnd() * 0.08),      // petal length
+      r0: 0.02 + 0.30 * Math.pow(t, 1.1),                // radius where it is attached
+      y0: -0.30 * t,                                     // outer petals attach lower
+      a0: lerp(0.02, 0.62, Math.pow(t, 1.15)) + (rnd() - 0.5) * 0.07,   // lean at the base
+      a1: lerp(-0.55, 0.85, t) + (rnd() - 0.5) * 0.1,    // bend along its length: inner close in, outer roll back
+      span: lerp(1.35, 0.62, t),                         // half the angle it wraps around the axis
+      ph: rnd() * TAU,
+      tone: 0.9 + rnd() * 0.2
+    };
+  }
+  function widthAt(v) {
+    var rise = Math.sin(Math.min(1, v / 0.5) * Math.PI / 2);
+    var k = Math.max(0, v - 0.55) / 0.45;
+    var cap = Math.sqrt(Math.max(0, 1 - Math.pow(k, 2.2)));
+    return (0.28 + 0.72 * rise) * cap;
+  }
+  function petalGeometry(t, p) {
+    var NU = 16, NV = 20, j;
+    var out = [0], h = [0];
+    for (j = 1; j <= NV; j++) {
+      var s = (j - 0.5) / NV;
+      var a = p.a0 + p.a1 * Math.pow(s, 1.4);
+      out.push(out[j - 1] + p.L * Math.sin(a) / NV);
+      h.push(h[j - 1] + p.L * Math.cos(a) / NV);
+    }
+    return grid(NU, NV, function (fu, fv) {
+      var u = fu * 2 - 1, v = fv, jj = Math.round(fv * NV);
+      var e = Math.abs(u);
+      var uh = u * widthAt(v);
+      var curl = 0.10 * p.L * Math.pow(e, 2.2) * Math.pow(Math.max(0, (v - 0.45) / 0.55), 1.6) * (0.4 + 0.6 * t);
+      var ripple = 0.018 * p.L * Math.sin(uh * 5.5 + p.ph) * Math.pow(v, 1.2) * (0.3 + 0.7 * t);
+      var rr = Math.max(0.012, p.r0 + out[jj] + curl + ripple);
+      var th = uh * p.span;
+      tmp.copy(C.pBase).lerp(C.pMid, smooth(0, 0.42, v)).lerp(C.pTip, smooth(0.38, 1, v) * (0.55 + 0.45 * t));
+      var ao = lerp(0.36, 1, smooth(0, 0.75, v)) * (1 - 0.14 * e * e);
+      var vein = 1 + 0.05 * Math.sin(u * Math.PI * 7 + p.ph) * v;
+      var k = ao * vein * p.tone;
+      return [rr * Math.cos(th) - p.r0, h[jj], rr * Math.sin(th), tmp.r * k, tmp.g * k, tmp.b * k];
+    });
+  }
+
+  var bloom = new THREE.Group();
+  plant.add(bloom);
+  var petals = [];
+  var rnd = rng(11);
+  var petalMat = new THREE.MeshPhysicalMaterial({
+    vertexColors: true, roughness: 0.58, metalness: 0, side: THREE.DoubleSide,
+    sheen: 1, sheenRoughness: 0.45, sheenColor: new THREE.Color(0xff6b81)
+  });
+  for (var n = 0; n < NP; n++) {
+    var t = n / (NP - 1), p = petalParams(t, rnd);
+    var grp = new THREE.Group();
+    grp.rotation.y = -(n * GOLDEN + (rnd() - 0.5) * 0.25);
+    var mesh = new THREE.Mesh(petalGeometry(t, p), petalMat);
+    mesh.position.set(p.r0, p.y0, 0);      // the pivot the petal opens around
+    grp.add(mesh);
+    bloom.add(grp);
+    petals.push({ mesh: mesh, t: t });
+  }
+
+  /* ---------- stem, sepals, leaves, thorns ---------- */
+  var greenMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0, side: THREE.DoubleSide });
+  var stemMat = new THREE.MeshStandardMaterial({ color: 0x2c5e2d, roughness: 0.55, metalness: 0 });
+
+  function leafGeo(len, wid, fold, droop, serr) {
+    return grid(10, 18, function (fu, fv) {
+      var u = fu * 2 - 1, v = fv, e = Math.abs(u);
+      var hw = Math.pow(Math.sin(Math.PI * Math.pow(v, 0.8)), 0.85);
+      var saw = (serr && v > 0.12 && v < 0.96) ? 1 - 0.10 * ((v * 16) % 1) : 1;
+      var z = u * hw * wid * saw;
+      var y = -droop * len * v * v + fold * Math.abs(z) + 0.012 * Math.sin(v * 9);
+      tmp.copy(C.gDark).lerp(C.gMid, smooth(0, 0.7, 1 - e * 0.8) * (0.5 + 0.5 * Math.sin(Math.PI * v)));
+      if (e < 0.1) tmp.lerp(C.gLight, 0.45 * (1 - e / 0.1));
+      var k = 0.8 + 0.2 * v;
+      return [v * len, y, z, tmp.r * k, tmp.g * k, tmp.b * k];
+    });
+  }
+
+  var stemCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, -0.36, 0),
+    new THREE.Vector3(0.03, -0.8, 0.03),
+    new THREE.Vector3(-0.06, -1.4, 0.02),
+    new THREE.Vector3(0.07, -2.0, -0.04),
+    new THREE.Vector3(0.04, -2.7, 0.0)
+  ]);
+  plant.add(new THREE.Mesh(new THREE.TubeGeometry(stemCurve, 90, 0.04, 10, false), stemMat));
+
+  var receptacle = new THREE.Mesh(new THREE.SphereGeometry(0.17, 18, 14), stemMat);
+  receptacle.position.set(0, -0.38, 0);
+  receptacle.scale.set(1, 0.9, 1);
+  plant.add(receptacle);
+
+  var sepalGeo = leafGeo(0.62, 0.115, 0.5, 0.06, false);
+  for (var s = 0; s < 5; s++) {
+    var sg = new THREE.Group();
+    sg.position.set(0, -0.36, 0);
+    sg.rotation.y = s * TAU / 5 + 0.3;
+    sg.rotation.z = -0.55;
+    var sm = new THREE.Mesh(sepalGeo, greenMat);
+    sm.position.x = 0.05;
+    sg.add(sm);
+    plant.add(sg);
+  }
+
+  var leafBig = leafGeo(0.78, 0.26, 0.42, 0.30, true);
+  var petioleGeo = new THREE.CylinderGeometry(0.016, 0.010, 0.36, 6);
+  petioleGeo.rotateZ(Math.PI / 2);
+  petioleGeo.translate(0.18, 0, 0);
+  function compound(u, az, tilt, scale) {
+    var g = new THREE.Group();
+    g.add(new THREE.Mesh(petioleGeo, stemMat));
+    var tip = new THREE.Mesh(leafBig, greenMat);
+    tip.position.x = 0.34;
+    g.add(tip);
+    [-1, 1].forEach(function (sd) {
+      var lf = new THREE.Mesh(leafBig, greenMat);
+      lf.position.x = 0.19;
+      lf.rotation.y = sd * 0.95;
+      lf.scale.setScalar(0.62);
+      g.add(lf);
+    });
+    g.position.copy(stemCurve.getPointAt(u));
+    g.rotation.y = az;
+    g.rotation.z = tilt;
+    g.scale.setScalar(scale);
+    plant.add(g);
+  }
+  compound(0.30, 0.5, 0.42, 1);
+  compound(0.52, 0.5 + Math.PI * 1.1, 0.36, 0.9);
+
+  var thornGeo = new THREE.ConeGeometry(0.028, 0.13, 6);
+  var thornMat = new THREE.MeshStandardMaterial({ color: 0x6a2418, roughness: 0.6, metalness: 0 });
+  var yAxis = new THREE.Vector3(0, 1, 0);
+  [0.12, 0.2, 0.42, 0.63, 0.75, 0.86].forEach(function (u, k) {
+    var az = k * 2.4 + 0.7;
+    var dir = new THREE.Vector3(Math.cos(az), 0.55, Math.sin(az)).normalize();
+    var th = new THREE.Mesh(thornGeo, thornMat);
+    th.position.copy(stemCurve.getPointAt(u)).addScaledVector(dir, 0.03);
+    th.quaternion.setFromUnitVectors(yAxis, dir);
+    plant.add(th);
+  });
+
+  /* ---------- a few drifting motes ---------- */
+  var DUST = 80, dustPos = new Float32Array(DUST * 3), dustSpd = new Float32Array(DUST);
+  var dr = rng(5);
+  for (var q = 0; q < DUST; q++) {
+    dustPos[q * 3] = (dr() - 0.5) * 6;
+    dustPos[q * 3 + 1] = (dr() - 0.5) * 5;
+    dustPos[q * 3 + 2] = (dr() - 0.5) * 4;
+    dustSpd[q] = 0.03 + dr() * 0.06;
+  }
+  var dustGeo = new THREE.BufferGeometry();
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+  scene.add(new THREE.Points(dustGeo, new THREE.PointsMaterial({ color: 0xff9aa8, size: 0.03, transparent: true, opacity: 0.45, depthWrite: false })));
+
+  /* ---------- bloom animation ---------- */
+  var BLOOM_TIME = 3.8;
+  var bloomT = reduce ? 99 : 0;
+  function easeOut(x) { return 1 - Math.pow(1 - x, 3); }
+  function poseBloom() {
+    var open = clamp(bloomT / BLOOM_TIME, 0, 1);
+    for (var i = 0; i < petals.length; i++) {
+      var pt = petals[i], t = pt.t;
+      var local = easeOut(clamp((open - (1 - t) * 0.32) / 0.68, 0, 1));
+      pt.mesh.rotation.z = 0.9 * Math.pow(t, 1.3) * (1 - local);    // closed bud: petals hug the heart
+      pt.mesh.scale.setScalar(lerp(0.88, 1, local));
+    }
+  }
+  poseBloom();
+  document.getElementById('replay').addEventListener('click', function () { bloomT = 0; poseBloom(); });
+
+  /* ---------- turning and zooming ---------- */
+  var yaw = 0.5, pitch = 0.28, vyaw = 0, zoom = 1, idle = 0, dragging = false, dist = 6;
+  var pts = new Map(), lastPinch = 0;
+  function pinchDist() {
+    var a = Array.from(pts.values());
+    return a.length < 2 ? 0 : Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y);
+  }
+  stage.addEventListener('pointerdown', function (e) {
+    if (e.target.closest && e.target.closest('button')) return;
+    try { stage.setPointerCapture(e.pointerId); } catch (err) {}
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    dragging = true; idle = 0; vyaw = 0;
+    stage.classList.add('drag');
+    if (pts.size === 2) lastPinch = pinchDist();
+  });
+  stage.addEventListener('pointermove', function (e) {
+    var p = pts.get(e.pointerId);
+    if (!p) return;
+    var dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.size === 1) {
+      yaw += dx * 0.0085;
+      pitch = clamp(pitch + dy * 0.006, -0.45, 1.1);
+      vyaw = dx * 0.0085;
+    } else if (pts.size === 2) {
+      var d = pinchDist();
+      if (lastPinch > 0 && d > 0) zoom = clamp(zoom * (lastPinch / d), 0.55, 1.7);
+      lastPinch = d;
+    }
+    idle = 0;
+  });
+  function endPointer(e) {
+    pts.delete(e.pointerId);
+    if (pts.size < 2) lastPinch = 0;
+    if (pts.size === 0) { dragging = false; stage.classList.remove('drag'); }
+  }
+  stage.addEventListener('pointerup', endPointer);
+  stage.addEventListener('pointercancel', endPointer);
+  stage.addEventListener('lostpointercapture', endPointer);
+  stage.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    zoom = clamp(zoom * (1 + e.deltaY * 0.0012), 0.55, 1.7);
+    idle = 0;
+  }, { passive: false });
+
+  /* ---------- size and loop ---------- */
+  function resize() {
+    var w = stage.clientWidth, h = stage.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    var th = Math.tan(camera.fov * Math.PI / 360);
+    dist = Math.max(1.8 / th, 1.45 / (th * camera.aspect));   // fit the bloom width and the whole stem
+  }
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
+  window.addEventListener('resize', resize);
+  resize();
+
+  var clock = new THREE.Clock();
+  function frame() {
+    requestAnimationFrame(frame);
+    var dt = Math.min(clock.getDelta(), 0.05);
+    if (bloomT < BLOOM_TIME + 0.1) { bloomT += dt; poseBloom(); }
+    if (!dragging) {
+      yaw += vyaw; vyaw *= 0.94;
+      idle += dt;
+      if (idle > 2.5 && !reduce) yaw += 0.28 * dt;
+    }
+    if (!reduce) {
+      for (var i = 0; i < DUST; i++) {
+        var y = dustPos[i * 3 + 1] + dustSpd[i] * dt;
+        dustPos[i * 3 + 1] = y > 2.5 ? -2.5 : y;
+      }
+      dustGeo.attributes.position.needsUpdate = true;
+    }
+    root.rotation.x = pitch;
+    root.rotation.y = yaw;
+    camera.position.set(0, 0, dist * zoom);
+    camera.lookAt(0, 0, 0);
+    renderer.render(scene, camera);
+  }
+  frame();
+})();
+</script>
+
+</html>
